@@ -14,7 +14,8 @@
 - Создание ссылки (с опциональным `custom_alias` и `ttl_seconds`), идемпотентность по URL.
 - Редирект по коду с **синхронным** `+1` к счётчику и проверкой TTL.
 - Метаданные ссылки, удаление.
-- `/healthz`, `/readyz` (пинг Postgres + Redis).
+- `/healthz` (без зависимостей), `/readyz` (Postgres — критичен → 503; Redis — мягкая
+  деградация, не валит готовность; обоснование в [api.md](./api.md#get-healthz-и-readyz)).
 - Redis как **синхронный** read-through кэш (это не конкурентность, просто кэш).
 - Чистые слои с интерфейсами, валидация, идиоматичные ошибки, graceful shutdown.
 - Table-driven unit-тесты на service, интеграционные на repository через testcontainers.
@@ -60,7 +61,8 @@ type Link struct {
 
 Объяви интерфейсы `LinkRepository` и `Cache` в пакете `service` (на стороне потребителя) и
 напиши бизнес-логику: генерация кода (base62), нормализация URL + `url_hash` (sha256),
-проверка алиаса регуляркой, вычисление `expires_at`, проверка TTL при редиректе.
+проверка алиаса регуляркой **и по reserved-списку** (`metrics`/`api`/`healthz`/... → 400,
+иначе алиас затенит маршрут), вычисление `expires_at`, проверка TTL при редиректе.
 
 ```go
 func (s *LinkService) Redirect(ctx context.Context, code string) (string, error) {
@@ -121,8 +123,10 @@ func main() {
     defer stop()
 
     cfg := config.Load()
-    pool := mustPgxPool(ctx, cfg)          // defer pool.Close()
-    rdb := mustRedis(cfg)                  // defer rdb.Close()
+    pool := mustPgxPool(ctx, cfg)
+    defer pool.Close()                     // ресурсы закрываются на выходе
+    rdb := mustRedis(cfg)
+    defer rdb.Close()
     svc := service.NewLinkService(postgres.New(pool), redis.New(rdb), cfg)
     srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httptransport.NewRouter(svc, cfg)}
 
@@ -135,7 +139,7 @@ func main() {
     <-ctx.Done() // сигнал
     sctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
     defer cancel()
-    _ = srv.Shutdown(sctx) // дать запросам доиграть
+    _ = srv.Shutdown(sctx) // дать запросам доиграть; затем сработают defer'ы выше
 }
 ```
 
@@ -144,12 +148,14 @@ func main() {
 - [ ] Слои `handler → service → repository` разделены, интерфейсы на границах.
 - [ ] Service не импортирует `net/http`; repository не содержит бизнес-логики.
 - [ ] Валидация входа: пустой/невалидный URL → 400, плохой алиас → 400, `ttl < 0` → 400.
-- [ ] Идемпотентность: тот же URL без алиаса → тот же `code` (через `UNIQUE(url_hash)`).
+- [ ] Идемпотентность: тот же URL **без алиаса и без TTL** → тот же `code` (через частичный
+      `UNIQUE(url_hash) WHERE is_custom=false AND expires_at IS NULL`); алиас/TTL → новая строка.
 - [ ] Кастомный алиас занят → `409 ALIAS_TAKEN`.
 - [ ] Редирект отдаёт **302**, синхронно инкрементит `click_count`, проверяет TTL (просрочено → 410).
 - [ ] Read-through Redis-кэш: miss → Postgres → populate; инвалидация при delete.
 - [ ] Идиоматичные ошибки: сентинелы, `%w`-обёртка, `errors.Is/As` в маппинге.
-- [ ] `/healthz` без зависимостей; `/readyz` пингует Postgres и Redis (fail → 503).
+- [ ] `/healthz` без зависимостей; `/readyz` → `503` только при недоступном Postgres; Redis
+      проверяется, но его отказ = `degraded`, не `503` (Redis — всего лишь кэш).
 - [ ] Graceful shutdown по `SIGINT/SIGTERM` с таймаутом, закрытие pool/redis.
 - [ ] Миграции применяются (goose), таблица `links` с индексами создаётся.
 - [ ] Table-driven unit-тесты на service зелёные.

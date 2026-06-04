@@ -46,9 +46,13 @@
 
 | Вопрос | Рекомендация | Где обосновано |
 |---|---|---|
-| 301 или 302 для редиректа | **302** (Found) | [api.md](./api.md), [architecture.md](./architecture.md) |
+| 301 или 302 для редиректа | **302** (Found); 307/308 нерелевантны — метод всегда GET | [api.md](./api.md), [architecture.md](./architecture.md) |
 | goose или golang-migrate | **goose** | [data-model.md](./data-model.md) |
 | Kafka или NATS | **Kafka** (учебная ценность) | [architecture.md](./architecture.md) |
 | Политика backpressure | **drop + метрика** на горячем пути | [architecture.md](./architecture.md) |
-| Семантика доставки в Kafka | **fire-and-forget** для счётчика, at-least-once опционально для аналитики | [architecture.md](./architecture.md) |
+| Триггер флаша батча | по **числу событий** (`pending`), не по `len(map)` | [architecture.md](./architecture.md) |
+| Семантика доставки в Kafka | **fire-and-forget** для счётчика; at-least-once **+ дедуп по `ClickID`** для точной аналитики | [architecture.md](./architecture.md) |
+| Идемпотентность создания | только для «простых» ссылок (без алиаса и TTL) — частичный `UNIQUE(url_hash)` | [data-model.md](./data-model.md) |
+| Зависимости `/readyz` | гейт только на **Postgres**; Redis — `degraded`, не валит готовность | [api.md](./api.md) |
+| Graceful drain | завершение по **закрытию канала** + потолок `SHUTDOWN_TIMEOUT` в `main` | [architecture.md](./architecture.md) |
 | Порядок написания слоёв | **repository → service → handler** | [project-structure.md](./project-structure.md) |

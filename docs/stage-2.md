@@ -28,11 +28,16 @@
 
    ```go
    type ClickEvent struct {
-       Code string
-       TS   time.Time
+       ClickID string    // уникальный id для дедупа Kafka-аналитики (UUID или code:unixnano:rand)
+       Code    string    // он же ключ партиции Kafka
+       TS      time.Time
    }
    clickCh := make(chan ClickEvent, cfg.ClickChannelBuffer) // буфер, напр. 10000
    ```
+
+   `ClickID` нужен не внутреннему счётчику (там инкремент-дельты), а Kafka-ветке:
+   at-least-once может прислать дубль, и consumer дедупит по `ClickID` (см.
+   [architecture.md](./architecture.md#kafka-семантика-доставки)).
 
 2. **Неблокирующий send из сервиса** (backpressure = drop + метрика):
 
@@ -62,7 +67,9 @@
    ```
 
 5. **Graceful drain**: `http.Shutdown` → `close(clickCh)` → воркеры дочитывают `range`,
-   делают финальный `flush`, `wg.Wait()`. Порядок обязателен (см.
+   делают финальный `flush`, `wg.Wait()` под потолком `SHUTDOWN_TIMEOUT`. Воркер
+   **не** селектит на отмену root-контекста (иначе по SIGTERM бросит непрочитанный буфер) —
+   сигнал завершения только через закрытие канала. Порядок и обоснование обязательны (см.
    [architecture.md](./architecture.md#graceful-shutdown-и-drain)).
 
 ### Backpressure: принятое решение
@@ -97,10 +104,8 @@ func RateLimit(cfg RateLimitCfg) func(http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
             key := clientKey(r, cfg)            // IP или API-ключ из заголовка
             lim := limiters.get(key)            // rate.NewLimiter(rps, burst)
-            res := lim.Reserve()
-            setRateHeaders(w, lim)              // X-RateLimit-*
-            if !res.OK() || res.Delay() > 0 {
-                res.Cancel()
+            w.Header().Set("X-RateLimit-Limit", strconv.Itoa(cfg.Burst))
+            if !lim.Allow() {                   // reject без «бронирования» токена
                 w.Header().Set("Retry-After", "1")
                 writeError(w, 429, "RATE_LIMITED", "too many requests")
                 return
@@ -112,8 +117,15 @@ func RateLimit(cfg RateLimitCfg) func(http.Handler) http.Handler {
 ```
 
 - База — `golang.org/x/time/rate` (часть расширенной stdlib, не «зависимость ради зависимости»).
+- **`Allow()`, а не `Reserve()`.** `Allow()` — это чистый «пропустить/отклонить» без побочного
+  «бронирования» токена; `Reserve()` резервирует токен и требует обязательного `Cancel()` на
+  каждом пути отказа, иначе подъедает бакет. Для middleware reject-семантики `Allow()` идиоматичнее.
+- **Заголовки только те, что реально вычислимы.** `golang.org/x/time/rate` **не** отдаёт
+  «остаток токенов», поэтому `X-RateLimit-Remaining`/`-Reset` для непрерывного token-bucket
+  не определены корректно и в спеке убраны (см. [api.md](./api.md#rate-limiting-этап-2)).
+  Отдаём `X-RateLimit-Limit` (= burst) всегда и `Retry-After` при `429`. Если очень нужен
+  `Remaining` — придётся вести счётчик токенов вручную, мимо `rate.Limiter`.
 - Ключ — IP (по умолчанию) или API-ключ (`RATE_LIMIT_KEY=api_key`).
-- Заголовки `X-RateLimit-*`, `Retry-After` — см. [api.md](./api.md#rate-limiting-этап-2).
 - Эвиктируй неактивные лимитеры по TTL, чтобы map не рос бесконечно.
 
 ## Фича 4: Background expiry sweeper
@@ -129,12 +141,16 @@ func (s *Sweeper) Run(ctx context.Context) {
         case <-ctx.Done():
             return // graceful stop
         case <-t.C:
-            n, err := s.repo.DeleteExpired(ctx) // DELETE ... WHERE expires_at < now()
+            // DELETE ... WHERE expires_at < now() RETURNING code
+            codes, err := s.repo.DeleteExpired(ctx)
             if err != nil {
                 s.log.Error("sweep failed", "err", err)
                 continue
             }
-            s.metrics.SweptTotal.Add(float64(n))
+            for _, code := range codes {
+                _ = s.cache.Del(ctx, code) // инвалидируем кэш удалённых ссылок
+            }
+            s.metrics.SweptTotal.Add(float64(len(codes)))
         }
     }
 }
@@ -142,7 +158,12 @@ func (s *Sweeper) Run(ctx context.Context) {
 
 - Запускается в `main`, останавливается по отмене `ctx` в graceful shutdown.
 - Использует частичный индекс `idx_links_expires_at` (см. [data-model.md](./data-model.md#индексы--сводка)).
-- Не забудь инвалидировать удалённые коды в Redis (или полагайся на TTL кэша).
+- **`DeleteExpired` возвращает `RETURNING code`**, и sweeper делает `cache.Del` по каждому —
+  иначе удалённая ссылка останется в Redis до `CACHE_TTL` (по умолчанию 10m) и будет
+  отдаваться из кэша уже после удаления строки. Полагаться только на TTL кэша здесь
+  недостаточно (см. [data-model.md](./data-model.md#ttl-и-истечение)).
+- Аналогично: при кэшировании ссылки с `expires_at` ставь TTL ключа
+  `min(CACHE_TTL, время_до_истечения)`, чтобы протухшая ссылка не пережила свой срок в кэше.
 
 ## Фича 5: Метрики Prometheus
 
@@ -153,10 +174,15 @@ func (s *Sweeper) Run(ctx context.Context) {
 |---|---|---|
 | `urlshort_http_request_duration_seconds` | Histogram | p50/p99 латентности (главная цифра) |
 | `urlshort_click_queue_depth` | Gauge | живая глубина канала под нагрузкой |
-| `urlshort_click_batch_size` | Histogram | размеры флашей |
+| `urlshort_click_batch_size` | Histogram | число **событий** во флаше (`pending`, не `len(map)`) |
 | `urlshort_clicks_dropped_total` | Counter | backpressure-дропы |
 
 `queue_depth` обновляй как `len(clickCh)` периодически или при каждом send.
+
+> `batch_size` наблюдает счётчик событий `pending`, а не количество уникальных кодов
+> `len(batch)`. Это тот же `pending`, по которому срабатывает порог `BATCH_SIZE_N` — иначе
+> на перекошенном трафике метрика покажет единицы, а порог размера не сработает (см.
+> [architecture.md](./architecture.md#async-click-pipeline)).
 
 ## Чеклист корректности конкурентности
 
@@ -166,8 +192,11 @@ func (s *Sweeper) Run(ctx context.Context) {
 - [ ] Нет гонок по разделяемому состоянию (батчи **локальны** для воркера, не общие).
 - [ ] `clickCh` закрывается ровно один раз и **после** `http.Shutdown` (иначе паника send в
       закрытый канал).
-- [ ] На shutdown ни одно принятое в канал событие не теряется: воркеры доделывают финальный
-      flush, `sync.WaitGroup` дожидается их.
+- [ ] Воркер завершается по **закрытию канала** (`ok == false`), а не по `ctx.Done()`;
+      принудительный потолок — отдельный `SHUTDOWN_TIMEOUT` в `main`, а не внутри воркера.
+- [ ] На shutdown событие не теряется **при дренаже в пределах `SHUTDOWN_TIMEOUT`**: воркеры
+      доделывают финальный flush, `sync.WaitGroup` дожидается их. За потолком — осознанная
+      потеря остатка (метрика), это граница graceful-периода.
 - [ ] Send в канал неблокирующий (drop-политика) — горячий путь не блокируется.
 - [ ] `keyed limiter store` потокобезопасен (мьютекс/`sync.Map`) и эвиктит старые ключи.
 - [ ] Метрики `queue_depth`/`batch_size`/`dropped` обновляются и видны под нагрузкой.
@@ -179,10 +208,17 @@ func (s *Sweeper) Run(ctx context.Context) {
 
 ### Что и как мерить
 
+> **Сначала выключи rate limit для замера.** Лимитер висит на всём роутере (по умолчанию
+> `RATE_LIMIT_ENABLED=true`, `RATE_LIMIT_RPS=100`/burst `200` **на один IP**). Нагрузка
+> идёт с одного хоста на `-rate=2000`, поэтому с включённым лимитером почти всё уйдёт в
+> `429`, а p99 (главная цифра проекта) станет бессмысленным. Для прогона выставь
+> `RATE_LIMIT_ENABLED=false` (или подними лимит существенно выше целевого RPS). Сам лимитер
+> тестируй отдельным сценарием, а не во время замера латентности конвейера.
+
 1. Подними **Этап 1**, прогрей кэш (создай ссылку, кликни пару раз).
-2. Запусти нагрузку **только на редирект** `/{code}` (горячий путь).
+2. Запусти нагрузку **только на редирект** `/{code}` (горячий путь) с выключенным лимитером.
 3. Сними p50/p99 латентности.
-4. Подними **Этап 2**, повтори ту же нагрузку на тот же эндпоинт.
+4. Подними **Этап 2** (так же без лимитера), повтори ту же нагрузку на тот же эндпоинт.
 5. Положи цифры рядом.
 
 Ожидание: на Этапе 1 p99 редиректа тащит за собой латентность `UPDATE` + контеншн по строке
@@ -240,7 +276,8 @@ k6 run redirect_load.js
 
 - [ ] Редирект больше не ждёт запись в БД (подтверждено замером p99 до/после).
 - [ ] `go test -race ./...` зелёный.
-- [ ] На shutdown ни одно событие из канала не потеряно (drain + финальный flush).
+- [ ] На shutdown событие из канала не потеряно при дренаже в пределах `SHUTDOWN_TIMEOUT`
+      (drain через закрытие канала + финальный flush; потолок по времени — в `main`).
 - [ ] Метрики показывают живой `queue_depth` под нагрузкой; видны `batch_size` и `dropped`.
 - [ ] Async pipeline: канал → worker pool → батчевый флаш одним запросом.
 - [ ] Backpressure: drop + метрика, обоснованно.

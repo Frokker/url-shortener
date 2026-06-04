@@ -37,7 +37,7 @@ Postgres, доступ через `pgx`/`pgxpool`. Одна основная т�
 |---|---|---|---|
 | `code` | `text` | **PRIMARY KEY**, `CHECK (char_length(code) BETWEEN 3 AND 32)` | короткий код (он же алиас); ключ редиректа |
 | `original_url` | `text` | `NOT NULL`, `CHECK (original_url <> '')` | целевой URL |
-| `url_hash` | `bytea` | `NOT NULL`, **UNIQUE** | SHA-256 от нормализованного URL — для идемпотентности |
+| `url_hash` | `bytea` | `NOT NULL`, **partial UNIQUE** (см. ниже) | SHA-256 от нормализованного URL — для идемпотентности «простых» ссылок |
 | `is_custom` | `boolean` | `NOT NULL DEFAULT false` | задан ли алиас пользователем |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | момент создания |
 | `expires_at` | `timestamptz` | `NULL` | срок жизни; `NULL` = бессрочно |
@@ -67,23 +67,50 @@ type Link struct {
 Требование README: «одинаковый URL → тот же код (через unique-констрейнт)». Реализуется
 **на уровне БД**, потому что только так корректно при гонке двух одновременных вставок.
 
-Подход: `UNIQUE` по `url_hash = sha256(normalize(original_url))`.
+**Идемпотентность по URL применяется только к «простым» ссылкам** — без кастомного алиаса
+и без TTL. Иначе один глобальный `UNIQUE(url_hash)` ломает остальную модель:
+
+- кастомный алиас для уже сокращённого URL стал бы невозможен (конфликт по `url_hash`
+  раньше, чем создастся алиас);
+- два запроса с разным `ttl_seconds` на один URL не ужились бы — второй молча унаследовал
+  бы чужой `expires_at`;
+- пересоздание протухшего URL вернуло бы старый мёртвый код с `200`.
+
+Поэтому констрейнт **частичный**: уникальность `url_hash` действует только там, где
+`is_custom = false AND expires_at IS NULL`. Кастомные и срочные ссылки всегда создают
+новую строку с новым `code`.
+
+```sql
+-- частичный уникальный индекс: дедуп только «простых» ссылок
+CREATE UNIQUE INDEX links_url_hash_plain_key ON links (url_hash)
+WHERE is_custom = false AND expires_at IS NULL;
+```
+
+Создание простой ссылки (без алиаса и TTL) — идемпотентно:
 
 ```sql
 INSERT INTO links (code, original_url, url_hash, is_custom, created_at, expires_at)
-VALUES ($1, $2, $3, $4, now(), $5)
-ON CONFLICT (url_hash) DO NOTHING
+VALUES ($1, $2, $3, false, now(), NULL)
+ON CONFLICT (url_hash) WHERE is_custom = false AND expires_at IS NULL DO NOTHING
 RETURNING code, original_url, is_custom, created_at, expires_at, click_count;
 ```
 
 - Если вставка прошла → вернётся новая строка.
-- Если конфликт по `url_hash` (URL уже сокращён) → `RETURNING` ничего не вернёт; делаем
-  добор `SELECT ... WHERE url_hash = $3` и возвращаем существующий код. Клиент получает
-  тот же `code` — идемпотентность.
+- Если конфликт по частичному индексу (этот URL уже сокращён «просто») → `RETURNING` ничего
+  не вернёт; делаем добор `SELECT ... WHERE url_hash = $3 AND is_custom = false AND
+  expires_at IS NULL` и возвращаем существующий код. Клиент получает тот же `code`.
 
 Нормализация URL (минимум): нижний регистр схемы и хоста, убрать дефолтный порт, убрать
 завершающий слэш у пути-корня. Важно зафиксировать правила нормализации один раз — от них
 зависит, что считается «тем же URL».
+
+**Правило приоритета при создании** (фиксируем однозначно):
+
+| Запрос | Поведение |
+|---|---|
+| `url`, без `custom_alias`, без/`0` `ttl` | идемпотентно: тот же URL → тот же `code` (`200` на повторе) |
+| `url` + `custom_alias` | всегда новая строка; `code = alias`; конфликт по `PRIMARY KEY(code)` → `ErrAliasTaken` (409). Дедуп по URL **не** применяется |
+| `url` + `ttl_seconds > 0` | всегда новая строка с `expires_at`; дедуп по URL **не** применяется |
 
 Отдельный случай — **кастомный алиас**: тут `code` задаёт пользователь, конфликт ловится по
 `PRIMARY KEY (code)` и трактуется как `ErrAliasTaken` (409), а не как идемпотентный повтор.
@@ -96,6 +123,12 @@ RETURNING code, original_url, is_custom, created_at, expires_at, click_count;
   `expires_at` с текущим временем; если просрочено → `410 Gone` и ссылка не редиректит.
 - **Активная чистка** (Этап 2, sweeper): фоновая горутина на `time.Ticker` периодически
   удаляет просроченные строки, чтобы таблица не пухла и кэш не держал мусор.
+- **Согласование с кэшем.** TTL записи в Redis и TTL ссылки — разные вещи, и их нужно
+  связать. При кэшировании ссылки с `expires_at` ставь TTL ключа
+  `min(CACHE_TTL, время_до_истечения)` — иначе протухшая (а после sweep'а и удалённая)
+  ссылка будет жить в кэше до `CACHE_TTL` (по умолчанию 10m) и отдаваться из него. Плюс
+  sweeper должен инвалидировать удалённые коды в Redis (`cache.Del`), а не полагаться только
+  на TTL. Подробнее — в [stage-2.md](./stage-2.md#фича-4-background-expiry-sweeper).
 
 ```sql
 -- ленивая проверка делается в коде по выбранной строке;
@@ -138,12 +171,23 @@ Kafka-поток `clicks` (consumer пишет агрегаты) или прям
 | | | **PRIMARY KEY (code, bucket)** | upsert-агрегация |
 
 ```sql
--- идемпотентный upsert агрегата (at-least-once consumer может слать дубли)
+-- агрегирующий upsert (truncate-гранулярность должна совпадать с той, что спросит /stats)
 INSERT INTO click_aggregates (code, bucket, clicks)
-VALUES ($1, date_trunc('hour', $2::timestamptz), 1)
+VALUES ($1, date_trunc($2 /* 'hour' | 'minute' */, $3::timestamptz), 1)
 ON CONFLICT (code, bucket) DO UPDATE
 SET clicks = click_aggregates.clicks + EXCLUDED.clicks;
 ```
+
+> Гранулярность `bucket` на стороне consumer'а должна совпадать с той, что принимает
+> `/stats` (`bucket=hour|minute`, см. [api.md](./api.md)). Если consumer пишет только
+> часовые бакеты, запрос `bucket=minute` не найдёт данных. Выбери: либо хранить самую мелкую
+> гранулярность (минуты) и доагрегировать в час на чтении, либо вести оба уровня. Для
+> учебного проекта проще хранить минуты и сворачивать в час запросом.
+>
+> **Важно (at-least-once):** этот upsert **аддитивный** и потому **не** идемпотентен против
+> дублей доставки — повторное событие удвоит счётчик. Для точности consumer должен дедупить
+> по `ClickID` до инкремента (см.
+> [architecture.md](./architecture.md#kafka-семантика-доставки)).
 
 Сырая таблица `click_events` (необязательна — нужна, если хочешь хранить каждое событие):
 
@@ -163,7 +207,7 @@ SET clicks = click_aggregates.clicks + EXCLUDED.clicks;
 | Индекс | Таблица | Назначение |
 |---|---|---|
 | `links_pkey` (PK по `code`) | `links` | редирект и lookup по коду |
-| `links_url_hash_key` (UNIQUE) | `links` | идемпотентность создания |
+| `links_url_hash_plain_key` (partial UNIQUE) | `links` | идемпотентность создания «простых» ссылок (`is_custom=false AND expires_at IS NULL`) |
 | `idx_links_expires_at` (partial) | `links` | ускорение sweeper'а и проверок TTL |
 | `click_aggregates_pkey` (PK по `code, bucket`) | `click_aggregates` | upsert и выборка для /stats |
 | `idx_click_aggregates_code_bucket` | `click_aggregates` | диапазонные запросы по времени |
@@ -216,10 +260,12 @@ CREATE TABLE links (
     is_custom    boolean     NOT NULL DEFAULT false,
     created_at   timestamptz NOT NULL DEFAULT now(),
     expires_at   timestamptz NULL,
-    click_count  bigint      NOT NULL DEFAULT 0 CHECK (click_count >= 0),
-
-    CONSTRAINT links_url_hash_key UNIQUE (url_hash)
+    click_count  bigint      NOT NULL DEFAULT 0 CHECK (click_count >= 0)
 );
+
+-- идемпотентность только для «простых» ссылок (без алиаса и без TTL)
+CREATE UNIQUE INDEX links_url_hash_plain_key ON links (url_hash)
+WHERE is_custom = false AND expires_at IS NULL;
 
 CREATE INDEX idx_links_expires_at ON links (expires_at)
 WHERE expires_at IS NOT NULL;

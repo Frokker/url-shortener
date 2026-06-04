@@ -42,7 +42,7 @@
 | `FLUSH_INTERVAL_T` | duration | `1s` | нет | флаш батча по таймеру (что раньше — N или T) |
 | `KAFKA_BROKERS` | string (csv) | `localhost:9092` | нет* | список брокеров; пусто → Kafka отключена |
 | `KAFKA_TOPIC` | string | `clicks` | нет | топик для событий кликов |
-| `KAFKA_ACKS` | string | `none` | нет | `none`=fire-and-forget, `all`=at-least-once |
+| `KAFKA_ACKS` | string | `none` | нет | `none`=acks=0 (fire-and-forget), `leader`=acks=1, `all`=acks=all (at-least-once) |
 | `KAFKA_ENABLED` | bool | `false` | нет | включить producer |
 | `RATE_LIMIT_ENABLED` | bool | `true` | нет | включить token-bucket middleware |
 | `RATE_LIMIT_RPS` | float | `100` | нет | пополнение токенов в секунду на ключ |
@@ -60,8 +60,11 @@
   только в реальной перегрузке. Слишком большой → больше потенциальная потеря на жёстком
   kill; разумный старт — 10k.
 - `BATCH_SIZE_N` vs `FLUSH_INTERVAL_T` — баланс «свежесть счётчика против числа round-trip».
-  N=500/T=1s означает: при высоком трафике флашим по 500 (эффективно), при низком — раз в
-  секунду (счётчик не «зависает» дольше секунды).
+  N=500/T=1s означает: при высоком трафике флашим по 500 **событиям** (эффективно), при
+  низком — раз в секунду (счётчик не «зависает» дольше секунды). Важно: `N` считается по
+  числу накопленных кликов (`pending`), а **не** по числу уникальных кодов в батче
+  (`len(map)`) — иначе на перекошенном трафике порог почти не срабатывает и флаш висит только
+  на таймере (см. [architecture.md](./architecture.md#async-click-pipeline)).
 - `WORKER_POOL_SIZE` — обычно небольшое число (равно/около числу ядер БД-пула). Больше
   воркеров → больше параллельных `UPDATE`, но и больше контеншн в Postgres.
 
@@ -154,7 +157,7 @@ type KafkaConfig struct {
     Enabled bool
     Brokers []string
     Topic   string
-    Acks    string // "none" | "all"
+    Acks    string // "none" (acks=0) | "leader" (acks=1) | "all" (acks=all)
 }
 
 type RateLimitConfig struct {

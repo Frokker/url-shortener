@@ -77,7 +77,7 @@ goose -dir migrations postgres "$POSTGRES_DSN" status
 | Эндпоинт | Назначение | Использование |
 |---|---|---|
 | `GET /healthz` | процесс жив, без проверки зависимостей | liveness-проба оркестратора |
-| `GET /readyz` | Postgres **и** Redis отвечают на ping | readiness-проба; 503 → трафик не слать |
+| `GET /readyz` | **Postgres** отвечает на ping (критично); Redis — `degraded`, не валит готовность | readiness-проба; `503` только при недоступном Postgres → трафик не слать |
 
 ```bash
 curl -s http://localhost:8080/healthz   # {"status":"ok"}
@@ -96,7 +96,7 @@ curl -s http://localhost:8080/readyz     # {"status":"ready","checks":{...}}
 | `urlshort_http_request_duration_seconds` | Histogram | `method`, `route`, `status` | латентность запросов; p50/p99 — главная цифра до/после |
 | `urlshort_http_requests_total` | Counter | `method`, `route`, `status` | счётчик запросов по кодам |
 | `urlshort_click_queue_depth` | Gauge | — | текущая глубина канала кликов (`len(clickCh)`) |
-| `urlshort_click_batch_size` | Histogram | — | размер флашируемых батчей |
+| `urlshort_click_batch_size` | Histogram | — | число **событий** во флаше (`pending`, не число уникальных кодов) |
 | `urlshort_clicks_dropped_total` | Counter | — | события, отброшенные при полном буфере (backpressure) |
 | `urlshort_clicks_flushed_total` | Counter | — | успешно записанные в БД клики |
 | `urlshort_flush_errors_total` | Counter | — | ошибки батчевого флаша |
@@ -134,6 +134,11 @@ curl -s http://localhost:8080/metrics | grep urlshort_
 Цель — снять p50/p99 редиректа и сравнить Этап 1 с Этапом 2. Полная методика и шаблон
 таблицы результатов — в [stage-2.md](./stage-2.md#методика-замера-p99-допосле).
 
+> **Перед прогоном выключи rate limit** (`RATE_LIMIT_ENABLED=false`) или подними лимит сильно
+> выше целевого RPS. Иначе нагрузка с одного IP на `-rate=2000` упрётся в дефолтные
+> 100 rps/burst 200 и почти всё уйдёт в `429`, исказив p99. Подробнее — в
+> [stage-2.md](./stage-2.md#методика-замера-p99-допосле).
+
 ### Подготовка
 
 ```bash
@@ -165,14 +170,16 @@ k6 run scripts/redirect_load.js   # см. пример в stage-2.md
 
 ## Graceful shutdown
 
-По `SIGINT`/`SIGTERM` приложение завершается, **не теряя принятых событий кликов**.
-Точная последовательность и обоснование порядка — в
-[architecture.md](./architecture.md#graceful-shutdown-и-drain).
+По `SIGINT`/`SIGTERM` приложение дренирует канал **без потерь — если успевает уложиться в
+`SHUTDOWN_TIMEOUT`**. За этим потолком остаток сливается best-effort и часть событий может
+потеряться осознанно (метрика `drain_timeouts`). Точная последовательность и обоснование
+порядка — в [architecture.md](./architecture.md#graceful-shutdown-и-drain).
 
 Кратко:
 1. сигнал → `http.Server.Shutdown` (перестаём принимать новые запросы, даём текущим доиграть);
 2. `close(clickCh)` (только после Shutdown — иначе паника send в закрытый канал);
-3. воркеры дочитывают канал, делают **финальный flush** остатка батча, `wg.Wait()`;
+3. воркеры дочитывают канал **по его закрытию** (не по `ctx.Done()`), делают **финальный
+   flush** остатка батча, `wg.Wait()` под потолком `SHUTDOWN_TIMEOUT` (`select` в `main`);
 4. останавливаем sweeper (отмена ctx) и Kafka producer (flush + close);
 5. закрываем pgxpool и redis client.
 
@@ -185,8 +192,11 @@ docker compose kill -s SIGTERM app   # или Ctrl+C при go run
 ```
 
 В логах должно быть видно: `http server stopped` → `click channel closed` →
-`workers drained, final flush N events` → `shutdown complete`. `clicks_flushed_total` после
-рестарта должен соответствовать числу принятых кликов (минус осознанные дропы при перегрузке).
+`workers drained, final flush N events` → `shutdown complete`. `clicks_flushed_total` должен
+сойтись с числом принятых в канал кликов (= принятые минус `clicks_dropped_total` при
+перегрузке; и минус остаток за `SHUTDOWN_TIMEOUT`, если дренаж не успел — этого в норме быть
+не должно). Метрику `clicks_flushed_total` инкрементит воркер на каждом успешном флаше (на
+величину `pending`), см. [architecture.md](./architecture.md#async-click-pipeline).
 
 ## Типовые проблемы
 
@@ -198,4 +208,6 @@ docker compose kill -s SIGTERM app   # или Ctrl+C при go run
 | `clicks_dropped_total` высокий | буфер мал / воркеров мало / медленный флаш | подними `CLICK_CHANNEL_BUFFER`, `WORKER_POOL_SIZE`, проверь БД |
 | p99 редиректа высокий на Этапе 2 | случайно остался синхронный `IncrementClicks` | убедись, что `Redirect` только шлёт в канал |
 | Счётчик `clicks` отстаёт | это норма: до `FLUSH_INTERVAL_T` | ожидаемое следствие батчинга |
-| Идемпотентность не работает | нет `UNIQUE(url_hash)` или разная нормализация | проверь миграцию и правила нормализации URL |
+| Идемпотентность не работает | нет частичного `UNIQUE(url_hash)` или разная нормализация | проверь миграцию (`links_url_hash_plain_key`) и правила нормализации URL |
+| Кастомный алиас `metrics`/`api` ломает роутинг | нет reserved-денидиста | добавь проверку алиаса по reserved-списку (см. [api.md](./api.md#post-apiv1links--создать)) |
+| Протухшая ссылка ещё редиректит/видна | кэш не инвалидирован после sweep | sweeper должен `cache.Del`; TTL ключа = `min(CACHE_TTL, до истечения)` |
