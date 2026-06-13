@@ -1,0 +1,78 @@
+# Конфигурация golangci-lint (формат v2) для CI-пайплайна.
+# Запуск: golangci-lint run ./... --config .golangci.pipeline.yaml
+# Документация: https://golangci-lint.run/usage/configuration/
+version: "2"
+
+run:
+  # Таймаут на весь прогон линтеров.
+  timeout: 5m
+  # Разрешаем несколько параллельных запусков (актуально для CI-кэша).
+  allow-parallel-runners: true
+
+linters:
+  # Включаем только явно перечисленные линтеры.
+  default: none
+  enable:
+    - errcheck      # непроверенные ошибки
+    - govet         # подозрительные конструкции
+    - ineffassign   # неиспользуемые присваивания
+    - staticcheck   # статический анализ (включает бывший gosimple)
+    - unused        # неиспользуемый код
+    - gocyclo       # цикломатическая сложность
+    - goconst       # повторяющиеся строковые литералы
+    - misspell      # опечатки в комментариях/строках
+    - unconvert     # лишние преобразования типов
+    - bodyclose     # незакрытые http.Response.Body
+    - nilerr        # return nil при ненулевой ошибке
+    - prealloc      # слайсы, которые можно предвыделить
+    - lll           # длинные строки
+
+  settings:
+    govet:
+      # Отдельный анализатор shadow (бывший check-shadowing).
+      enable:
+        - shadow
+    gocyclo:
+      min-complexity: 15
+    goconst:
+      min-len: 2
+      min-occurrences: 2
+    misspell:
+      locale: US
+    lll:
+      line-length: 140
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+  exclusions:
+    # Не линтуем сгенерированный код (protobuf и т.п.).
+    paths:
+      - ".*\\.pb\\.go$"
+      - ".*\\.pb\\.gw\\.go$"
+      - ".*_grpc\\.pb\\.go$"
+    rules:
+      # В тестах допускаем менее строгие правила.
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - errcheck
+          - lll
+
+# Форматтеры в v2 вынесены в отдельную секцию.
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      # Группирует импорты текущего модуля отдельным блоком.
+      local-prefixes:
+        - github.com/Frokker/url-shortener
+
+issues:
+  # Выводить все найденные проблемы, без лимитов по умолчанию.
+  max-issues-per-linter: 0
+  max-same-issues: 0

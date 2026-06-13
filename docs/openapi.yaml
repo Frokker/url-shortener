@@ -1,0 +1,538 @@
+openapi: 3.0.3
+info:
+  title: URL Shortener API
+  version: "1.0.0"
+  description: |
+    HTTP API сервиса сокращения ссылок.
+
+    Базовый префикс API — `/api/v1`. Редирект (`GET /{code}`) и служебные
+    маршруты (`/healthz`, `/readyz`, `/metrics`) живут в корне.
+
+    Все тела запросов/ответов — `application/json; charset=utf-8`, кроме
+    редиректа (пустое тело + заголовок `Location`).
+
+    Эндпоинты, помеченные тегом **stage-2**, появляются на Этапе 2
+    (аналитика, метрики, rate limiting).
+  contact:
+    name: URL Shortener
+  license:
+    name: Educational project
+
+servers:
+  - url: http://localhost:8080
+    description: Локальная разработка (BASE_URL по умолчанию)
+
+tags:
+  - name: links
+    description: Управление короткими ссылками
+  - name: redirect
+    description: Горячий путь редиректа
+  - name: analytics
+    description: Аналитика по кликам (Этап 2)
+  - name: ops
+    description: Health-чеки и метрики
+
+paths:
+  /api/v1/links:
+    post:
+      tags: [links]
+      summary: Создать короткую ссылку
+      description: |
+        Создаёт короткую ссылку.
+
+        **Идемпотентность.** Повторный `POST` с тем же `url` **без** `custom_alias`
+        и **без** `ttl_seconds` (или `ttl_seconds = 0`) возвращает существующий код
+        со статусом `200`. Запросы с `custom_alias` или `ttl_seconds > 0` всегда
+        создают новую строку (`201`).
+
+        **Reserved-алиасы.** `custom_alias` из множества
+        `{healthz, readyz, metrics, api, favicon.ico, robots.txt}` отклоняется
+        с `400 INVALID_REQUEST`, чтобы не затенить корневые маршруты.
+      operationId: createLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLinkRequest'
+            examples:
+              generated:
+                summary: Сгенерированный код, бессрочно
+                value:
+                  url: "https://example.com/very/long/path?a=1"
+              custom:
+                summary: Кастомный алиас с TTL
+                value:
+                  url: "https://example.com"
+                  custom_alias: "promo"
+                  ttl_seconds: 3600
+      responses:
+        '201':
+          description: Создана новая ссылка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateLinkResponse'
+              example:
+                code: "promo"
+                short_url: "http://localhost:8080/promo"
+                expires_at: "2026-06-04T13:00:00Z"
+        '200':
+          description: |
+            Идемпотентный повтор — тот же `url` без алиаса и без TTL уже
+            существовал, возвращён существующий код.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateLinkResponse'
+              example:
+                code: "aZ3xQ"
+                short_url: "http://localhost:8080/aZ3xQ"
+                expires_at: null
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '409':
+          description: Кастомный алиас занят
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: ALIAS_TAKEN
+                  message: "custom alias is already in use"
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/v1/links/{code}:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [links]
+      summary: Метаданные ссылки
+      description: |
+        Возвращает метаданные. Просроченные ссылки тоже отдаются (метаданные
+        доступны до удаления sweeper'ом). `clicks` — денормализованный счётчик;
+        на Этапе 2 может отставать на одно окно флаша.
+      operationId: getLink
+      responses:
+        '200':
+          description: Найдено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkMetadata'
+              example:
+                code: "promo"
+                original_url: "https://example.com"
+                clicks: 142
+                is_custom: true
+                created_at: "2026-06-04T12:00:00Z"
+                expires_at: "2026-06-04T13:00:00Z"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [links]
+      summary: Удалить ссылку
+      description: |
+        Удаляет ссылку и инвалидирует запись в Redis-кэше. На Этапе 2
+        `ON DELETE CASCADE` чистит и `click_aggregates`. Повторное удаление
+        отсутствующего кода → `404`.
+      operationId: deleteLink
+      responses:
+        '204':
+          description: Удалено
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/v1/links/{code}/stats:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [analytics]
+      summary: Расширенная аналитика по времени (Этап 2)
+      description: |
+        Агрегаты по времени из `click_aggregates`. Доступно только на Этапе 2.
+      operationId: getLinkStats
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: Начало окна (RFC3339).
+          schema:
+            type: string
+            format: date-time
+          example: "2026-06-04T00:00:00Z"
+        - name: to
+          in: query
+          required: false
+          description: Конец окна (RFC3339).
+          schema:
+            type: string
+            format: date-time
+          example: "2026-06-04T23:59:59Z"
+        - name: bucket
+          in: query
+          required: false
+          description: Гранулярность бакета.
+          schema:
+            type: string
+            enum: [hour, minute]
+            default: hour
+      responses:
+        '200':
+          description: Найдено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsResponse'
+              example:
+                code: "promo"
+                total: 142
+                bucket: hour
+                series:
+                  - ts: "2026-06-04T12:00:00Z"
+                    clicks: 90
+                  - ts: "2026-06-04T13:00:00Z"
+                    clicks: 52
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /{code}:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [redirect]
+      summary: Редирект на оригинальный URL
+      description: |
+        Главный горячий путь. Возвращает **302 Found** с заголовком `Location`,
+        указывающим на оригинальный URL, и учитывает клик.
+
+        - Этап 1: счётчик кликов инкрементируется синхронно.
+        - Этап 2: событие клика кладётся в буферизованный канал, редирект отдаётся сразу.
+      operationId: redirect
+      responses:
+        '302':
+          description: Найдено и не просрочено — редирект на оригинал
+          headers:
+            Location:
+              description: Оригинальный URL
+              schema:
+                type: string
+                format: uri
+              example: "https://example.com/very/long/path?a=1"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: Ссылка просрочена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: GONE
+                  message: "link has expired"
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness
+      description: Процесс жив. Зависимости не проверяются — всегда `200`.
+      operationId: healthz
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                required: [status]
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness
+      description: |
+        Готовность принимать трафик. Критичная зависимость — **Postgres**.
+        Redis проверяется, но его отказ → `degraded`, не `503` (read-through кэш,
+        cache-miss деградирует к Postgres).
+      operationId: readyz
+      responses:
+        '200':
+          description: Готов (Postgres отвечает; Redis может быть `degraded`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+              examples:
+                all_ok:
+                  value:
+                    status: ready
+                    checks: { postgres: ok, redis: ok }
+                redis_degraded:
+                  value:
+                    status: ready
+                    checks: { postgres: ok, redis: degraded }
+        '503':
+          description: Не готов — Postgres недоступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessResponse'
+              example:
+                status: not_ready
+                checks: { postgres: fail, redis: ok }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Метрики Prometheus (Этап 2)
+      description: Экспозиция метрик в text-формате Prometheus.
+      operationId: metrics
+      responses:
+        '200':
+          description: Метрики в формате Prometheus
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP urlshort_requests_total Total HTTP requests
+                # TYPE urlshort_requests_total counter
+                urlshort_requests_total{path="/api/v1/links",method="POST"} 42
+
+components:
+  parameters:
+    Code:
+      name: code
+      in: path
+      required: true
+      description: Короткий код ссылки (сгенерированный base62 или кастомный алиас).
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{1,32}$'
+      example: promo
+
+  schemas:
+    CreateLinkRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: |
+            Оригинальный URL. Непустой, схема только `http`/`https`
+            (`javascript:`/`data:`/`file:` отклоняются).
+          example: "https://example.com/very/long/path?a=1"
+        custom_alias:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{3,32}$'
+          description: |
+            Кастомный алиас. Не из reserved-списка
+            (`healthz`, `readyz`, `metrics`, `api`, `favicon.ico`, `robots.txt`).
+          example: promo
+        ttl_seconds:
+          type: integer
+          minimum: 0
+          description: Время жизни в секундах. `0` или отсутствует — бессрочно.
+          example: 3600
+
+    CreateLinkResponse:
+      type: object
+      required: [code, short_url, expires_at]
+      properties:
+        code:
+          type: string
+          example: promo
+        short_url:
+          type: string
+          format: uri
+          example: "http://localhost:8080/promo"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время истечения или `null` для бессрочной ссылки.
+          example: "2026-06-04T13:00:00Z"
+
+    LinkMetadata:
+      type: object
+      required: [code, original_url, clicks, is_custom, created_at, expires_at]
+      properties:
+        code:
+          type: string
+          example: promo
+        original_url:
+          type: string
+          format: uri
+          example: "https://example.com"
+        clicks:
+          type: integer
+          description: Денормализованный счётчик кликов.
+          example: 142
+        is_custom:
+          type: boolean
+          description: Был ли код задан как кастомный алиас.
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-06-04T12:00:00Z"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-06-04T13:00:00Z"
+
+    StatsResponse:
+      type: object
+      required: [code, total, bucket, series]
+      properties:
+        code:
+          type: string
+          example: promo
+        total:
+          type: integer
+          example: 142
+        bucket:
+          type: string
+          enum: [hour, minute]
+          example: hour
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatsPoint'
+
+    StatsPoint:
+      type: object
+      required: [ts, clicks]
+      properties:
+        ts:
+          type: string
+          format: date-time
+          example: "2026-06-04T12:00:00Z"
+        clicks:
+          type: integer
+          example: 90
+
+    ReadinessResponse:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          properties:
+            postgres:
+              type: string
+              enum: [ok, fail]
+            redis:
+              type: string
+              enum: [ok, degraded, fail]
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_REQUEST
+                - NOT_FOUND
+                - ALIAS_TAKEN
+                - GONE
+                - RATE_LIMITED
+                - INTERNAL
+                - NOT_READY
+              description: Машиночитаемый код ошибки.
+            message:
+              type: string
+              description: Человекочитаемое описание.
+
+  responses:
+    InvalidRequest:
+      description: |
+        Невалидный запрос — битый JSON, пустой/невалидный URL, плохой алиас,
+        reserved-алиас, не-`http(s)` схема, отрицательный TTL.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: INVALID_REQUEST
+              message: "url must use http or https scheme"
+
+    NotFound:
+      description: Кода нет в БД.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: NOT_FOUND
+              message: "link not found"
+
+    RateLimited:
+      description: Превышен лимит запросов (Этап 2).
+      headers:
+        X-RateLimit-Limit:
+          description: Размер бакета (burst).
+          schema:
+            type: integer
+          example: 200
+        Retry-After:
+          description: Через сколько секунд повторить.
+          schema:
+            type: integer
+          example: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: RATE_LIMITED
+              message: "too many requests"
+
+    Internal:
+      description: Непредвиденная ошибка сервера.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: INTERNAL
+              message: "internal server error"
